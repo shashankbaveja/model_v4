@@ -94,12 +94,34 @@ def calculate_all_features(df):
         group_df['sma_21'] = ta.trend.sma_indicator(group_df['close'], window=21, fillna=True)
         group_df['sma_200'] = ta.trend.sma_indicator(group_df['close'], window=200, fillna=True)
 
+        # --- Phase 1: Add custom base indicators for new features ---
+        group_df['kama_14'] = ta.momentum.kama(group_df['close'], window=14, fillna=True)
+        group_df['donchian_hband_10'] = ta.volatility.donchian_channel_hband(group_df['high'], group_df['low'], group_df['close'], window=10, fillna=True)
+        group_df['cmf_10'] = ta.volume.chaikin_money_flow(group_df['high'], group_df['low'], group_df['close'], group_df['volume'], window=10, fillna=True)
+        
+        # Calculate True Range for skewness
+        tr1 = group_df['high'] - group_df['low']
+        tr2 = abs(group_df['high'] - group_df['close'].shift(1))
+        tr3 = abs(group_df['low'] - group_df['close'].shift(1))
+        group_df['true_range'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        # --- End of Phase 1 ---
+
         feature_df = pd.DataFrame(index=group_df.index)
 
         momentum_f, reversion_f, common_f = parse_feature_strategies()
         features_to_build = list(set(momentum_f + reversion_f + common_f))
         features_to_build.append('market_regime_up')
         
+        # --- Add the 13 new features to the list to be built ---
+        new_features = [
+            'flag_mom5_pos', 'flag_pvt_slope', 'flag_macd_pos', 'flag_ema_xover',
+            'flag_sma20_slope', 'flag_kama_diff', 'flag_donch_up', 'flag_ch_vol',
+            'flag_tr_skew', 'flag_obv_slope', 'flag_vol_roc', 'flag_cmf_pos',
+            'flag_vpt_div', 'flag_vwap_dev'
+        ]
+        features_to_build.extend(new_features)
+        # --- End of new feature addition ---
+
         for feature in features_to_build:
             try:
                 # --- Momentum Features (Calculated on the resampled df) ---
@@ -165,6 +187,47 @@ def calculate_all_features(df):
                     feature_df[feature] = (group_df['trend_cci'] > 100).astype(int)
                 elif feature == 'CCI_oversold_below_minus100':
                     feature_df[feature] = (group_df['trend_cci'] < -100).astype(int)
+                
+                # --- New Features (Phase 2) ---
+                elif feature == 'flag_mom5_pos':
+                    feature_df[feature] = (group_df['close'].diff(5) > 0).astype(int)
+                elif feature == 'flag_pvt_slope':
+                    feature_df[feature] = (group_df['volume_vpt'].diff(5) > 0).astype(int) # PVT is same as VPT
+                elif feature == 'flag_macd_pos':
+                    feature_df[feature] = (group_df['trend_macd_diff'] > 0).astype(int)
+                elif feature == 'flag_ema_xover':
+                    feature_df[feature] = (group_df['trend_ema_fast'] > group_df['trend_ema_slow']).astype(int)
+                elif feature == 'flag_sma20_slope':
+                    feature_df[feature] = (group_df['trend_sma_slow'].diff(5) > 0).astype(int) # trend_sma_slow is 20-period
+                elif feature == 'flag_kama_diff':
+                    feature_df[feature] = ((group_df['kama_14'] - group_df['close']) / group_df['close'] > 0).astype(int)
+                elif feature == 'flag_donch_up':
+                    feature_df[feature] = (group_df['close'] > group_df['donchian_hband_10']).astype(int)
+                elif feature == 'flag_ch_vol': # This is ATR Volatility Spike, not Chaikin Volatility
+                    atr = group_df['volatility_atr']
+                    feature_df[feature] = ((atr.diff(5) / atr.shift(5)) > 0.25).astype(int)
+                elif feature == 'flag_tr_skew':
+                    feature_df[feature] = (group_df['true_range'].rolling(14).skew() > 0).astype(int)
+                elif feature == 'flag_obv_slope':
+                    feature_df[feature] = (group_df['volume_obv'].diff(5) > 0).astype(int)
+                elif feature == 'flag_vol_roc':
+                    feature_df[feature] = ((group_df['volume'].diff(5) / group_df['volume'].shift(5)) > 0.20).astype(int)
+                elif feature == 'flag_cmf_pos':
+                    feature_df[feature] = (group_df['cmf_10'] > 0).astype(int)
+                elif feature == 'flag_vpt_div':
+                    price_up = group_df['close'].diff(1) > 0
+                    vpt_down = group_df['volume_vpt'].diff(1) < 0
+                    price_down = group_df['close'].diff(1) < 0
+                    vpt_up = group_df['volume_vpt'].diff(1) > 0
+                    
+                    # Default to 0
+                    feature_df[feature] = 0
+                    # Bearish divergence
+                    feature_df.loc[price_up & vpt_down, feature] = -1
+                    # Bullish divergence
+                    feature_df.loc[price_down & vpt_up, feature] = 1
+                elif feature == 'flag_vwap_dev':
+                    feature_df[feature] = (abs(group_df['close'] - group_df['VWAP_D']) / group_df['VWAP_D'] > 0.01).astype(int)
                 
                 # --- Common Features (Calculated on the resampled df) ---
                 elif feature == 'ADX_strong_trend_above_25':
@@ -249,43 +312,85 @@ def calculate_all_features(df):
     return all_features_df
 
 
-def generate_binary_targets(df, config):
+def generate_multiclass_target(df, config):
     """
-    Generates binary target variables based on the method specified in the config.
+    Generates a multi-class target variable using the triple-barrier method.
     The input dataframe 'df' is expected to have a multi-index of (instrument_token, timestamp).
+    
+    - Target = +1: Profit target (upper barrier) is hit first.
+    - Target = -1: Stop loss (lower barrier) is hit first.
+    - Target =  0: Neither barrier is hit within the lookahead period (time barrier).
     """
-    print("Generating binary target variables...")
+    print("Generating multi-class target variable...")
     target_config = config['target_generation']
 
-    # Guard against empty dataframes from the filtering step
+    # Guard against empty dataframes
     if df.empty:
         print("  WARNING: Input dataframe for target generation is empty. Returning empty result.")
-        df['target_up'] = pd.Series(dtype='int')
-        df['target_down'] = pd.Series(dtype='int')
+        df['target'] = pd.Series(dtype='int')
         return df
 
-    # Sort index to ensure correct shifting within groups
+    # Sort index to ensure correct shifting and rolling operations within groups
     df.sort_index(inplace=True)
 
-    print("Using 'simple' target generation method.")
     lookahead_periods = target_config['lookahead_candles']
-    threshold = target_config['threshold_percent'] / 100.0
+    profit_threshold = target_config['threshold_percent'] / 100.0
+    stop_loss_threshold = target_config['stop_loss_pct'] / 100.0
     
-    print(f"  - Lookahead: {lookahead_periods} candles")
-    print(f"  - Threshold: {threshold*100}%")
+    print(f"  - Lookahead Horizon (Time Barrier): {lookahead_periods} candles")
+    print(f"  - Profit Target (Upper Barrier): {profit_threshold*100}%")
+    print(f"  - Stop Loss (Lower Barrier): -{stop_loss_threshold*100}%")
 
-    def _apply_simple_targets(group):
-        future_price = group['close'].shift(-lookahead_periods)
-        future_return = (future_price - group['close']) / group['close']
+    def _apply_triple_barrier(group):
+        n = len(group)
+        targets = np.zeros(n) # Default to 0 (time barrier hit)
+
+        for i in range(n):
+            entry_price = group['close'].iloc[i]
+            upper_barrier = entry_price * (1 + profit_threshold)
+            lower_barrier = entry_price * (1 - stop_loss_threshold)
+            
+            # Define the lookahead window for the current point
+            window_end = min(i + 1 + lookahead_periods, n)
+            window = group.iloc[i+1:window_end]
+            
+            if window.empty:
+                continue # No lookahead data available, target remains 0
+            
+            # Check if high hits the upper barrier in the window
+            hit_upper = window['high'] >= upper_barrier
+            # Check if low hits the lower barrier in the window
+            hit_lower = window['low'] <= lower_barrier
+
+            # Get the timestamp of the first hit for each barrier
+            upper_hit_time = window.index[hit_upper].min() if hit_upper.any() else pd.NaT
+            lower_hit_time = window.index[hit_lower].min() if hit_lower.any() else pd.NaT
+
+            # Determine the outcome based on which barrier was hit first
+            if pd.notna(upper_hit_time) and pd.notna(lower_hit_time):
+                # If both are hit, choose the one that happened first
+                if upper_hit_time <= lower_hit_time:
+                    targets[i] = 1
+                else:
+                    targets[i] = -1
+            elif pd.notna(upper_hit_time):
+                targets[i] = 1
+            elif pd.notna(lower_hit_time):
+                targets[i] = -1
         
-        group['target_up'] = (future_return >= threshold).astype(int)
-        group['target_down'] = (future_return <= -threshold).astype(int)
+        group['target'] = targets.astype(int)
         return group
 
-    df = df.groupby(level='instrument_token', group_keys=False).apply(_apply_simple_targets)
+    df = df.groupby(level='instrument_token', group_keys=False).apply(_apply_triple_barrier)
     
-    df.dropna(subset=['target_up', 'target_down'], inplace=True)
-    print("Simple binary target variables generated.")
+    # We don't drop NA based on the target anymore, as 0 is a valid class.
+    # However, we should still drop rows at the end where a full lookahead wasn't possible.
+    # The last 'lookahead_periods' of each group cannot have a reliable target.
+    df = df.groupby(level='instrument_token', group_keys=False).apply(
+        lambda x: x.iloc[:-lookahead_periods]
+    )
+    
+    print("Multi-class target variable generated.")
     return df
         
     
@@ -300,6 +405,18 @@ def main():
     momentum_cols_base = list(set(momentum_features + common_features + ['market_regime_up']))
     reversion_cols_base = list(set(reversion_features + common_features + ['market_regime_up']))
     
+    # --- Add new feature names to the save list to ensure they are not dropped ---
+    new_features_to_save = [
+        'flag_mom5_pos', 'flag_pvt_slope', 'flag_macd_pos', 'flag_ema_xover',
+        'flag_sma20_slope', 'flag_kama_diff', 'flag_donch_up', 'flag_ch_vol',
+        'flag_tr_skew', 'flag_obv_slope', 'flag_vol_roc', 'flag_cmf_pos',
+        'flag_vpt_div', 'flag_vwap_dev'
+    ]
+    # Add to both momentum and reversion so they are included in combined
+    momentum_cols_base.extend(new_features_to_save)
+    reversion_cols_base.extend(new_features_to_save)
+    # --- End of fix ---
+
     print(f"Momentum model will use {len(momentum_cols_base)} base features.")
     print(f"Mean Reversion model will use {len(reversion_cols_base)} base features.")
 
@@ -326,13 +443,13 @@ def main():
 
         
         all_features_df = calculate_all_features(df_resampled)
-        df_with_targets = generate_binary_targets(all_features_df, config)
+        df_with_targets = generate_multiclass_target(all_features_df, config)
         
         # The dataframe now has a multi-index (instrument_token, timestamp)
         # We need to handle this when saving. Resetting index is easiest.
         df_with_targets.reset_index(inplace=True)
 
-        target_cols = ['target_up', 'target_down']
+        target_cols = ['target']
         # Also add instrument_token to the columns to keep
         core_cols = ['instrument_token', 'timestamp'] + target_cols
 

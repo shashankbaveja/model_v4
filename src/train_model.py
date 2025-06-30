@@ -9,6 +9,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 import lightgbm as lgb
 from catboost import CatBoostClassifier
+from sklearn.utils import class_weight
+import numpy as np
 
 # Add the root directory for local library import
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,80 +18,78 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data_pipeline import load_config
 
 
-def load_data(strategy, target_name, config):
-    """Loads feature and target data for a given strategy and interval."""
-    print(f"Loading data for strategy: {strategy}, target: {target_name}")
+def load_data(strategy, config):
+    """Loads feature and target data for a given strategy."""
+    print(f"Loading data for strategy: {strategy}")
     
     processed_dir = 'data/processed'
     
     base_train_filename = f'train_{strategy}_with_patterns_features.parquet'
     train_filename = os.path.join(processed_dir, base_train_filename)
     print(f"Train filename: {train_filename}")
-
-    base_val_filename = f'validation_{strategy}_with_patterns_features.parquet'
-    val_filename = os.path.join(processed_dir, base_val_filename)
     
     try:
         train_df = pd.read_parquet(train_filename)
-
-        y_train = train_df.pop(target_name)
-        X_train = train_df.drop(columns=['target_up', 'target_down', 'instrument_token', 'timestamp'], errors='ignore')
-
-        val_df = pd.read_parquet(val_filename)
-        y_val = val_df.pop(target_name)
-        X_val = val_df.drop(columns=['target_up', 'target_down', 'instrument_token', 'timestamp'], errors='ignore')
+        y_train = train_df.pop('target')
+        X_train = train_df.drop(columns=['instrument_token', 'timestamp'], errors='ignore')
 
     except FileNotFoundError as e:
-        print(f"Error: Data file not found. Have you run feature generation and merging? Details: {e}")
+        print(f"Error: Data file not found. Have you run the feature generation? Details: {e}")
         sys.exit(1)
     except KeyError as e:
-        print(f"Error: Target column not found. Details: {e}")
+        print(f"Error: Target column 'target' not found. Details: {e}")
         sys.exit(1)
 
-    return X_train, y_train, X_val, y_val
+    return X_train, y_train
 
-def get_model(model_type, random_state, scale_pos_weight):
-    """Returns a model instance based on the type."""
+def get_model(model_type, random_state, class_weights=None):
+    """Returns a model instance based on the type, with optional class weights."""
     if model_type == "lightgbm":
-        return lgb.LGBMClassifier(random_state=random_state, scale_pos_weight=scale_pos_weight)
+        # Use 'multiclass' objective for multi-class classification
+        return lgb.LGBMClassifier(random_state=random_state, objective='multiclass', class_weight=class_weights)
     
     elif model_type == "random_forest":
-        return RandomForestClassifier(random_state=random_state, class_weight='balanced', n_jobs=-1)
+        return RandomForestClassifier(random_state=random_state, class_weight=class_weights, n_jobs=-1)
         
     elif model_type == "logistic_regression":
-        # Logistic Regression benefits from feature scaling
+        # Logistic Regression benefits from feature scaling and supports multi-class out of the box
         return Pipeline([
             ('scaler', StandardScaler()),
-            ('logit', LogisticRegression(random_state=random_state, class_weight='balanced', solver='liblinear'))
+            ('logit', LogisticRegression(random_state=random_state, class_weight=class_weights, solver='lbfgs', multi_class='auto'))
         ])
     elif model_type == "catboost":
-        return CatBoostClassifier(random_state=random_state, scale_pos_weight=scale_pos_weight, verbose=0)
+        # Use 'MultiClass' loss function and pass the calculated class weights
+        return CatBoostClassifier(random_state=random_state, loss_function='MultiClass', class_weights=class_weights, verbose=0)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
-def train_model(strategy, target_name, model_type, config):
-    """Trains a single model for a given strategy, target, and model type."""
+def train_model(strategy, model_type, config):
+    """Trains a single model for a given strategy and model type."""
     model_config = config['modeling']
     random_state = model_config['random_state']
     
-    X_train, y_train, X_val, y_val = load_data(strategy, target_name, config)
+    X_train, y_train = load_data(strategy, config)
     
-    print(f"Training a {model_type} model...")
+    print(f"Training a {model_type} model for multi-class classification...")
     print(f"  Training data loaded. Number of features: {len(X_train.columns)}")
 
-    # Calculate scale_pos_weight for LightGBM
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum() if (y_train == 1).sum() > 0 else 1
+    # --- Calculate Class Weights ---
+    # Compute weights to handle class imbalance
+    unique_classes = np.unique(y_train)
+    weights = class_weight.compute_class_weight('balanced', classes=unique_classes, y=y_train)
+    class_weights_dict = dict(zip(unique_classes, weights))
+    print(f"  Calculated class weights: {class_weights_dict}")
+    # --- End of Class Weight Calculation ---
 
-    model = get_model(model_type, random_state, scale_pos_weight)
+    model = get_model(model_type, random_state, class_weights=class_weights_dict)
     
-    # Fit the model
-    model.fit(X_train, y_train)
+    # Fit the model without a validation set or early stopping
+    model.fit(X_train, y_train, verbose=False)
+        
     print("Model training complete.")
 
     # Save the model
-    direction = 'up' if 'up' in target_name else 'down'
-    base_model_filename = f'{strategy}_{direction}_{model_type}_model.joblib'
-    model_filename = base_model_filename
+    model_filename = f'{strategy}_{model_type}_model.joblib'
     
     model_path = os.path.join('models', model_filename)
     os.makedirs('models', exist_ok=True)
@@ -103,15 +103,13 @@ def main():
     
     # Get parameters from the unified config
     model_config = config.get('modeling', {})
-    model_types = model_config.get('model_types', ['lightgbm'])
-    strategies = model_config.get('strategies_to_train', ['momentum', 'reversion','combined'])
-    targets = model_config.get('targets', ['target_up', 'target_down'])
+    model_types = model_config.get('model_types', ['catboost'])
+    strategies = model_config.get('strategies_to_train', ['combined'])
     
     for strategy in strategies:
         for model_type in model_types:
-            print(f"\n--- Training {model_type.upper()} Models for {strategy.upper()} Strategy ---")
-            for target_name in targets:
-                train_model(strategy, target_name, model_type, config)
+            print(f"\n--- Training {model_type.upper()} Model for {strategy.upper()} Strategy ---")
+            train_model(strategy, model_type, config)
 
     print("\n--- Model Training Pipeline Finished ---")
 

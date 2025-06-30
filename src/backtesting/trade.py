@@ -5,6 +5,9 @@ Trade class to represent individual trading positions.
 from datetime import datetime, timedelta
 from typing import Optional
 
+import pandas as pd
+from pandas.tseries.offsets import BDay
+
 
 class Trade:
     """Represents a single trade with entry, exit conditions and PnL tracking."""
@@ -45,7 +48,8 @@ class Trade:
             
             # Calculate max holding date
             entry_dt = datetime.strptime(entry_date, '%Y-%m-%d')
-            max_holding_dt = entry_dt + timedelta(days=holding_period - 1)
+            # max_holding_dt = entry_dt + timedelta(days=holding_period - 1)
+            max_holding_dt = pd.to_datetime(entry_dt) + BDay(holding_period - 1)
             self.max_holding_date = max_holding_dt.strftime('%Y-%m-%d')
             self.execution_status = 'executed'
         

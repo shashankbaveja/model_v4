@@ -12,7 +12,7 @@ log_file_path = "reports/trades/daily_trades.csv"
 
 def generate_all_signals():
     """
-    Loads all trained models, generates trade signals based on specified thresholds,
+    Loads all trained multi-class models, generates trade signals based on model predictions,
     and saves them as new datasets containing OHLCV and signal data.
     """
     print("--- Starting Signal Generation Pipeline ---")
@@ -21,9 +21,8 @@ def generate_all_signals():
     # Get parameters from config
     model_config = config.get('modeling', {})
     data_config = config.get('data', {})
-    strategies = model_config.get('strategies_to_train', ['momentum', 'reversion', 'combined'])
-    model_types = model_config.get('model_types', ['lightgbm'])
-    thresholds = config.get('trading', {}).get('backtest_thresholds', [0.6])
+    strategies = model_config.get('strategies_to_train', ['combined'])
+    model_types = model_config.get('model_types', ['catboost'])
 
     # --- Setup Directories ---
     processed_dir = 'data/processed'
@@ -34,10 +33,11 @@ def generate_all_signals():
     # --- Load Raw Price Data ---
     # This contains the OHLCV data we need to join with the signals.
     try:
+        # Assuming test_raw is still the source of truth for prices
         raw_test_data = pd.read_parquet(os.path.join(processed_dir, 'test_raw.parquet'))
         print("Loaded raw test data for OHLCV information.")
     except FileNotFoundError as e:
-        print(f"Error: Raw test data not found. Details: {e}")
+        print(f"Error: Raw test data not found. It should be in 'data/processed/'. Details: {e}")
         sys.exit(1)
 
     # --- Main Loop for Signal Generation ---
@@ -53,67 +53,82 @@ def generate_all_signals():
             print(f"Warning: Feature data not found for strategy '{strategy}'. Skipping.")
             continue
         
+        # Columns to keep for the final output, but not for prediction
+        cols_to_keep_for_output = ['instrument_token', 'timestamp', 'target']
+
         # Prepare feature matrix X_test by dropping non-feature columns
-        X_test = feature_df.drop(columns=['target_up', 'target_down', 'instrument_token', 'timestamp'], errors='ignore')
+        X_test = feature_df.drop(columns=cols_to_keep_for_output, errors='ignore')
 
-        for direction in ['up']:
-            for model_type in model_types:
-                
-                model_name = f'{strategy}_{direction}_{model_type}_model.joblib'
-                model_path = os.path.join(models_dir, model_name)
+        for model_type in model_types:
+            model_name = f'{strategy}_{model_type}_model.joblib'
+            model_path = os.path.join(models_dir, model_name)
 
-                if not os.path.exists(model_path):
-                    print(f"  - Model not found: {model_path}. Skipping.")
-                    continue
+            if not os.path.exists(model_path):
+                print(f"  - Model not found: {model_path}. Skipping.")
+                continue
 
-                # Load the model and predict probabilities
-                print(f"  - Generating signals for: {model_name}")
-                model = joblib.load(model_path)
-                y_pred_proba = model.predict_proba(X_test)[:, 1]
+            # Load the model and predict classes and probabilities
+            print(f"  - Generating signals for: {model_name}")
+            model = joblib.load(model_path)
+            
+            # Predict the class directly (-1, 0, 1)
+            signals = model.predict(X_test)
+            
+            # Get the probability for ALL classes
+            y_pred_proba = model.predict_proba(X_test)
+            
+            # Create a temporary DataFrame with identifiers and the signal
+            temp_df = feature_df[cols_to_keep_for_output].copy()
+            temp_df['signal'] = signals
+            
+            # --- Assign probabilities for each class to new columns ---
+            # Assuming the model's classes_ are ordered [-1, 0, 1]
+            # It's safer to get the order directly from the trained model
+            class_order = model.classes_
+            prob_map = {
+                -1: 'prob_sell',
+                0: 'prob_hold',
+                1: 'prob_buy'
+            }
+            
+            for i, class_label in enumerate(class_order):
+                col_name = prob_map.get(class_label, f'prob_class_{class_label}')
+                temp_df[col_name] = y_pred_proba[:, i]
+            # --- End of probability assignment ---
 
-                for threshold in thresholds:
-                    # Create signal column based on the threshold
-                    signals = (y_pred_proba >= threshold).astype(int)
-                    signals_prob = y_pred_proba
+            # Merge with raw data to get OHLCV columns
+            final_signal_df = pd.merge(raw_test_data, temp_df, on=['instrument_token', 'timestamp'])
 
-                    # Create a temporary DataFrame with identifiers and the signal
-                    temp_df = feature_df[['instrument_token', 'timestamp']].copy()
-                    temp_df['signal'] = signals
-                    temp_df['signal_prob'] = signals_prob
-                    
-                    # Merge with raw data to get OHLCV columns
-                    # This ensures the final dataset has all necessary info for backtesting
-                    final_signal_df = pd.merge(raw_test_data, temp_df, on=['instrument_token', 'timestamp'])
+            # --- Print signals generated for today ---
+            todays_signals = final_signal_df[
+                (pd.to_datetime(final_signal_df['timestamp']).dt.date == pd.to_datetime('today').date()) &
+                (final_signal_df['signal'] != 0) # Show both BUY (1) and SELL (-1) signals
+            ]
+            if not todays_signals.empty:
+                print(f"    >>> Today's Signals ({model_name}):")
+                print(todays_signals[['instrument_token', 'close', 'signal', 'target', 'prob_buy', 'prob_sell', 'prob_hold']])
+                print("-" * 40)
+            else:
+                print(f"    >>> No BUY/SELL signals generated for today ({model_name})")
+            # --- End of section ---
 
-                    # --- Print signals generated for today ---
-                    todays_signals = final_signal_df[
-                        (pd.to_datetime(final_signal_df['timestamp']).dt.date == pd.to_datetime('today').date()) &
-                        (final_signal_df['signal'] == 1)
-                    ]
-                    if not todays_signals.empty:
-                        print(f"    >>> Today's Signals ({model_name}, thresh {threshold:.2f}):")
-                        print(todays_signals[['instrument_token', 'close']])
-                        print("-" * 40)
-                    else:
-                        print(f"    >>> No signals generated for today ({model_name}, thresh {threshold:.2f})")
-                    # --- End of section ---
+            # Save the final signal file
+            output_filename = f'{strategy}_{model_type}_signals.csv'
+            output_path = os.path.join(signals_dir, output_filename)
+            final_signal_df.to_csv(output_path, index=False)
 
-                    # Save the final signal file
-                    # output_filename = f'{strategy}_{direction}_{model_type}_thresh_{threshold:.2f}_signals.parquet'
-                    # output_path = os.path.join(signals_dir, output_filename)
-                    # final_signal_df.to_parquet(output_path, index=False)
-
-                    output_filename = f'{strategy}_{direction}_{model_type}_thresh_{threshold:.2f}_signals.csv'
-                    output_path = os.path.join(signals_dir, output_filename)
-                    final_signal_df.to_csv(output_path, index=False)
-
-                    data_end_date = data_config.get('test_end_date', datetime.now().strftime('%Y-%m-%d'))
-                    signal_df_for_gemini = final_signal_df[final_signal_df['timestamp'] == data_end_date][['instrument_token', 'signal', 'signal_prob']]
-                    signal_df_for_gemini = signal_df_for_gemini[signal_df_for_gemini['signal'] == 1][['instrument_token', 'signal', 'signal_prob']]
-                    
-                    signal_df_for_gemini.to_csv(log_file_path, index=False)
-                
-                    print(f"    - Saved signals to {output_path}")
+            data_end_date = data_config.get('test_end_date', datetime.now().strftime('%Y-%m-%d'))
+            signal_df_for_gemini = final_signal_df[final_signal_df['timestamp'] == data_end_date]
+            
+            # We need to keep the new probability columns
+            prob_cols_to_keep = [col for col in final_signal_df.columns if 'prob_' in col]
+            cols_to_keep = ['instrument_token', 'signal', 'target'] + prob_cols_to_keep
+            
+            signal_df_for_gemini = signal_df_for_gemini[signal_df_for_gemini['signal'] != 0][cols_to_keep]
+            
+            signal_df_for_gemini.to_csv(log_file_path, index=False)
+        
+            print(f"    - Saved signals to {output_path}")
 
     print("\n--- Signal Generation Pipeline Finished ---")
 

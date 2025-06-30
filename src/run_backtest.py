@@ -91,6 +91,47 @@ class DailyTradeLogger:
         df.to_csv(self.log_file_path, mode='a', header=False, index=False)
 
 
+def convert_multiclass_signals_to_binary(source_signal_file: str, thresholds: list):
+    """
+    Loads a multi-class signal file and converts it into one or more
+    binary-compatible signal files based on probability thresholds.
+    """
+    print(f"  > Converting '{os.path.basename(source_signal_file)}' for backtest compatibility...")
+    df = pd.read_csv(source_signal_file)
+
+    # Extract base name for new files, e.g., 'combined_catboost'
+    base_name = os.path.basename(source_signal_file).replace('_signals.csv', '')
+
+    for threshold in thresholds:
+        print(f"    - Applying threshold: {threshold}")
+        compatible_df = df.copy()
+
+        # 1. "prob_buy" column is the new "signal_prob" column
+        if 'prob_buy' in compatible_df.columns:
+            compatible_df.rename(columns={'prob_buy': 'signal_prob'}, inplace=True)
+        else:
+            print(f"    - WARNING: 'prob_buy' column not found in {source_signal_file}. Skipping.")
+            continue
+            
+        # 2. Modify "signal" column based on threshold
+        compatible_df['signal'] = (compatible_df['signal_prob'] >= threshold).astype(int)
+        
+        # 3. Drop remaining unused columns
+        cols_to_drop = ['prob_sell', 'prob_hold', 'target']
+        compatible_df.drop(columns=[col for col in cols_to_drop if col in compatible_df.columns], inplace=True, errors='ignore')
+
+        # Generate a compatible filename, e.g., combined_up_catboost_thresh_0.70_signals.csv
+        model_parts = base_name.split('_')
+        strategy = model_parts[0]
+        model_type = '_'.join(model_parts[1:])
+        
+        output_filename = f"{base_name}_compatible.csv"
+        output_path = os.path.join("data/signals", output_filename)
+        
+        compatible_df.to_csv(output_path, index=False)
+        print(f"    - Saved compatible file to: {output_path}")
+
+
 def main():
     """Run the complete backtesting process for all signal files."""
     print("="*80)
@@ -98,15 +139,36 @@ def main():
     print("="*80)
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Find all signal files
-    signals_pattern = "data/signals/*_up_*_thresh_*_signals.csv"
+    # Load config to get thresholds
+    with open("config/parameters.yml", 'r') as file:
+        config = yaml.safe_load(file)
+    backtest_thresholds = config.get('trading', {}).get('backtest_thresholds', [0.70])
+
+    # --- Step 1: Convert new multi-class signal files to compatible format ---
+    print("\n🔄 CONVERTING MULTI-CLASS SIGNALS TO BINARY FORMAT")
+    new_signals_pattern = "data/signals/combined_catboost_signals.csv"
+    all_signal_files = glob.glob(new_signals_pattern)
+    # Exclude old-style files from being re-processed to avoid errors
+    new_signal_files = [f for f in all_signal_files if '_up_' not in f and '_thresh_' not in f]
+
+    # print(f"  > New signal files: {new_signal_files}")
+
+    if not new_signal_files:
+        print(f"  > No new-style signal files found to convert.")
+    else:
+        for file in new_signal_files:
+            convert_multiclass_signals_to_binary(file, backtest_thresholds)
+
+    # --- Step 2: Run backtest on the compatible signal files ---
+    # Find all compatible signal files (the ones we just generated)
+    signals_pattern = "data/signals/*_compatible.csv"
     signal_files = glob.glob(signals_pattern)
     
     if not signal_files:
         print(f"❌ No signal files found matching pattern: {signals_pattern}")
         return 1
     
-    print(f"\n📁 Found {len(signal_files)} signal files to backtest:")
+    print(f"\n📁 Found {len(signal_files)} compatible signal files to backtest:")
     for file in signal_files:
         print(f"  - {os.path.basename(file)}")
     
