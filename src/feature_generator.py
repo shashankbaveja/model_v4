@@ -386,9 +386,9 @@ def generate_multiclass_target(df, config):
     # We don't drop NA based on the target anymore, as 0 is a valid class.
     # However, we should still drop rows at the end where a full lookahead wasn't possible.
     # The last 'lookahead_periods' of each group cannot have a reliable target.
-    df = df.groupby(level='instrument_token', group_keys=False).apply(
-        lambda x: x.iloc[:-lookahead_periods]
-    )
+    # df = df.groupby(level='instrument_token', group_keys=False).apply(
+    #     lambda x: x.iloc[:-lookahead_periods]
+    # )
     
     print("Multi-class target variable generated.")
     return df

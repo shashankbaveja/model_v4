@@ -4,7 +4,7 @@
 # Runs the complete trading pipeline every weekday at 3:00 PM
 
 # Set script configuration
-SCRIPT_DIR="/Users/shashankbaveja/Main/Projects/KiteConnectAPI/Model_v3"
+SCRIPT_DIR="/Users/shashankbaveja/Main/Projects/KiteConnectAPI/Model_v4"
 CONDA_ENV="/opt/anaconda3/envs/KiteConnect"
 PYTHON_SCRIPT="src/run_live.py"
 LOG_DIR="$SCRIPT_DIR/logs/automation"

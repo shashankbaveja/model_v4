@@ -209,9 +209,9 @@ def main():
         print("Symbol: ", trading_symbol, " Quantity: ", quantity)
             
         # Place order on NSE first
-        order_id = order_placement.place_market_order_live(
-            trading_symbol, 'NSE', 'BUY', quantity, 'CNC', 'Automatic'
-        )
+        # order_id = order_placement.place_market_order_live(
+        #     trading_symbol, 'NSE', 'BUY', quantity, 'CNC', 'Automatic'
+        # )
 
         # Check if the order placement returned an exception
         if isinstance(order_id, KiteException):
@@ -220,9 +220,9 @@ def main():
                 print(f"Instrument {trading_symbol} not found on NSE. Attempting on BSE.")
                 
                 # Retry placing the order on BSE
-                order_id_bse = order_placement.place_market_order_live(
-                    trading_symbol, 'BSE', 'BUY', quantity, 'CNC', 'Automatic'
-                )
+                # order_id_bse = order_placement.place_market_order_live(
+                #     trading_symbol, 'BSE', 'BUY', quantity, 'CNC', 'Automatic'
+                # )
 
                 if isinstance(order_id_bse, KiteException):
                     # If it failed on BSE as well

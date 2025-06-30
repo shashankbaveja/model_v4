@@ -10,6 +10,42 @@ from src.data_pipeline import load_config
 
 log_file_path = "reports/trades/daily_trades.csv"
 
+def convert_multiclass_signals_to_binary(source_signal_file: str, output_filename: str, thresholds: list):
+    """
+    Loads a multi-class signal file and converts it into one or more
+    binary-compatible signal files based on probability thresholds.
+    """
+    print(f"  > Converting '{os.path.basename(source_signal_file)}' for backtest compatibility...")
+    df = pd.read_csv(source_signal_file)
+
+    # Extract base name for new files, e.g., 'combined_catboost'
+    
+    for threshold in thresholds:
+        print(f"    - Applying threshold: {threshold}")
+        compatible_df = df.copy()
+
+        # 1. "prob_buy" column is the new "signal_prob" column
+        if 'prob_buy' in compatible_df.columns:
+            compatible_df.rename(columns={'prob_buy': 'signal_prob'}, inplace=True)
+        else:
+            print(f"    - WARNING: 'prob_buy' column not found in {source_signal_file}. Skipping.")
+            continue
+            
+        # 2. Modify "signal" column based on threshold
+        compatible_df['signal'] = (compatible_df['signal_prob'] >= threshold).astype(int)
+        
+        # 3. Drop remaining unused columns
+        cols_to_drop = ['prob_sell', 'prob_hold']
+        compatible_df.drop(columns=[col for col in cols_to_drop if col in compatible_df.columns], inplace=True, errors='ignore')
+
+        # Generate a compatible filename, e.g., combined_up_catboost_thresh_0.70_signals.csv
+        
+        
+        compatible_df.to_csv(output_filename, index=False)
+        print(f"    - Saved compatible file to: {output_filename}")
+        return compatible_df
+
+
 def generate_all_signals():
     """
     Loads all trained multi-class models, generates trade signals based on model predictions,
@@ -23,12 +59,15 @@ def generate_all_signals():
     data_config = config.get('data', {})
     strategies = model_config.get('strategies_to_train', ['combined'])
     model_types = model_config.get('model_types', ['catboost'])
+    backtest_thresholds = config.get('trading', {}).get('backtest_thresholds', [0.70])
+
 
     # --- Setup Directories ---
     processed_dir = 'data/processed'
     signals_dir = 'data/signals'
     models_dir = 'models'
     os.makedirs(signals_dir, exist_ok=True)
+
 
     # --- Load Raw Price Data ---
     # This contains the OHLCV data we need to join with the signals.
@@ -73,7 +112,6 @@ def generate_all_signals():
             
             # Predict the class directly (-1, 0, 1)
             signals = model.predict(X_test)
-            
             # Get the probability for ALL classes
             y_pred_proba = model.predict_proba(X_test)
             
@@ -117,11 +155,15 @@ def generate_all_signals():
             output_path = os.path.join(signals_dir, output_filename)
             final_signal_df.to_csv(output_path, index=False)
 
+            compatible_filename = f'{strategy}_{model_type}_compatible.csv'
+            compatible_filepath = os.path.join(signals_dir, compatible_filename)
+            compatible_df = convert_multiclass_signals_to_binary(output_path, compatible_filepath, backtest_thresholds)
+
             data_end_date = data_config.get('test_end_date', datetime.now().strftime('%Y-%m-%d'))
-            signal_df_for_gemini = final_signal_df[final_signal_df['timestamp'] == data_end_date]
+            signal_df_for_gemini = compatible_df[compatible_df['timestamp'] == data_end_date]
             
             # We need to keep the new probability columns
-            prob_cols_to_keep = [col for col in final_signal_df.columns if 'prob_' in col]
+            prob_cols_to_keep = [col for col in compatible_df.columns if 'signal_prob' in col]
             cols_to_keep = ['instrument_token', 'signal', 'target'] + prob_cols_to_keep
             
             signal_df_for_gemini = signal_df_for_gemini[signal_df_for_gemini['signal'] != 0][cols_to_keep]

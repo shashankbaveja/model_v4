@@ -4,7 +4,7 @@
 # This script activates the conda environment and runs data backfill
 
 # Set working directory
-cd "/Users/shashankbaveja/Main/Projects/KiteConnectAPI/Model_v3/src/data_backfill"
+cd "/Users/shashankbaveja/Main/Projects/KiteConnectAPI/Model_v4/src/data_backfill"
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
